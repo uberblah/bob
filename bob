@@ -1,0 +1,153 @@
+#!/usr/bin/env guile
+!#
+
+(use-modules (ice-9 match)
+	     (ice-9 ftw)
+	     (ice-9 regex)
+	     (ice-9 pretty-print)
+	     (ice-9 popen)
+	     (ice-9 rdelim)
+	     (srfi srfi-1)
+	     (srfi srfi-26)
+	     (srfi srfi-14))
+
+(define sep file-name-separator-string)
+(define sepset (string->char-set sep))
+
+(define (parsepath path)
+  (string-split path sepset))
+(define (makepath lst)
+  (string-join lst sep))
+
+(define args (command-line))
+
+(define (run-cmd cmd)
+  (display ">>> ")
+  (display cmd) (newline)
+  (system cmd))
+(define (read-cmd cmd)
+  (display "<<< ")
+  (display cmd) (newline)
+  (let ((result
+	 (string-filter (char-set-complement (char-set #\newline))
+			(read-string (open-input-pipe cmd)))))
+    (begin
+      (display result) (newline)
+      result)))
+
+(define srcdir "src")
+(define objdir "obj")
+(define libdir "lib")
+(define bindir "bin")
+
+(define cc "g++")
+(define ar "ar")
+(define cflags "-I. -std=c++11 -fPIC")
+
+(define libglfw
+  (read-cmd "pkg-config --static --libs glfw3"))
+(define libglew
+  (read-cmd "pkg-config --static --libs glew"))
+(define libs
+  (string-join (lset-union equal?
+			   (string-split libglfw #\space)
+			   (string-split libglew #\space))
+	       " "))
+
+(define ldflags
+  (string-append
+   "-std=c++11 "
+   libs))
+
+(define (srcfile? path)
+  (and (string-match ".cpp$" path) #t))
+(define (header? path)
+  (and (string-match ".h$" path) #t))
+(define (objfile? path)
+  (and (string-match ".o$" path) #t))
+
+(define (compile srcfile outname)
+  (define cmd (string-append cc " " cflags " -c " srcfile " -o " outname))
+  (run-cmd cmd))
+
+(define (link-lib srcfiles outname)
+  (define cmd (string-append ar " rcs " outname " " (string-join srcfiles " ")))
+  (run-cmd cmd))
+
+(define (link-bin srcfiles outname)
+  (define cmd (string-append cc " " (string-join srcfiles " ") " " ldflags " -o " outname))
+  (run-cmd cmd))
+
+(define (compile-all srcdir srcfile? objdir compile)
+  (define (proc name stats flag)
+    (define lspath (parsepath name))
+    (case flag
+      ((directory)
+       (let ((opath (makepath (cons objdir (cdr lspath)))))
+	 (if (not (file-exists? opath))
+	     (begin
+	       (run-cmd (string-append "mkdir " opath))
+	       #t)
+	     #t)))
+      ((regular)
+       (if (srcfile? name)
+	   (let* ((opath (string-append (makepath (cons objdir (cdr lspath))) ".o"))
+		  (renew (not
+			  (and (file-exists? opath)
+			       (> (stat:mtime (stat opath)) (stat:mtime stats))))))
+	     (if renew
+		 (begin
+		   (compile name opath)
+		   #t)
+		 #t))
+	   #t))))
+  (ftw srcdir proc))
+
+(define (listobjs objdir objfile?)
+  (define (menter? path stats result) #t)
+  (define (mdown path stats result) result)
+  (define (mup path stats result) result)
+  (define (mskip path stats result) result)
+  (define (mleaf path stats result)
+    (if (objfile? path)
+	(cons path result)
+	result))
+  (define (merror path stats errno result)
+    (display (list 'error path (strerror errno))) (newline)
+    result)
+  (file-system-fold menter? mleaf mdown mup mskip merror '() objdir))
+
+(define (link-dirlibs objdir objfile? libdir link)
+  (define (menter? path stats result) #t)
+  (define (mdown path stats result) (cons '() result))
+  (define (mup path stats result)
+    (define objs (car result))
+    (if (null? objs)
+	(cdr result)
+	(begin
+	  (let* ((lspath (parsepath path))
+		 (tgt (string-append (makepath (cons libdir (cdr lspath))) ".a"))
+		 (pdir (if (> (length lspath) 1)
+			   (makepath (cons libdir (reverse (cdr (reverse (cdr lspath))))))
+			   libdir)))
+	    (if (not (file-exists? pdir))
+		(run-cmd (string-append "mkdir -p " pdir)))
+	    (link objs tgt)
+	    (cons (append objs (cadr result)) (cddr result))))))
+  (define (mskip path stats result) result)
+  (define (mleaf path stats result)
+    (define libname
+      (string-append (makepath (cons libdir (cdr (reverse (cdr (reverse (parsepath path))))))) ".a"))
+    (if (or (not (objfile? path))
+	    (and (file-exists? libname)
+		 (< (stat:mtime stats) (stat:mtime (stat libname)))))
+	result
+	(cons (cons path (car result)) (cdr result))))
+  (define (merror path stats errno result) (display (list 'error path (strerror errno))) (newline) result)
+  (file-system-fold menter? mleaf mdown mup mskip merror '(()) objdir))
+
+(compile-all srcdir srcfile? objdir compile)
+(define objs (listobjs objdir objfile?))
+(if (not (file-exists? bindir))
+    (run-cmd (string-append "mkdir " bindir)))
+(link-bin objs (string-append bindir sep "main"))
